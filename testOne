@@ -22,6 +22,11 @@ pub struct Track {
     // Measured accel estimate at contact time (USED FOR AIMING ONLY)
     pub contact_acc: Vec2,
 
+    // --- NEW: small history window for stable accel estimation (AIMING ONLY) ---
+    pub hist_len: u8,
+    pub vel_hist: [Vec2; 4],
+    pub tick_hist: [u32; 4],
+
     // Estimate = propagated to "now" (for matching/logic)
     pub est_pos: Vec2,
     pub est_vel: Vec2,
@@ -116,18 +121,16 @@ impl Ship {
     const HIGH_UNCERTAINTY_LEAD_MULT: f64 = 0.25;
 
     // Fire control: acquire threshold is tighter than hold threshold for hysteresis
-    const FIRE_ACQUIRE_EPS: f64 = 0.060;     // was 0.040
-    const FIRE_HOLD_EPS: f64 = 0.120;        // was 0.080
-    const FIRE_W_HOLD: f64 = 2.4;            // was 1.2
-    const FIRE_LATCH_TICKS: u32 = 12;        // was 6
+    const FIRE_ACQUIRE_EPS: f64 = 0.060;
+    const FIRE_HOLD_EPS: f64 = 0.120;
+    const FIRE_LATCH_TICKS: u32 = 12;
 
     // Jitter resampling: adds unpredictability to aim point within uncertainty region
     const JITTER_RESAMPLE_TICKS: u32 = 4;
-    const JITTER_MAX_FRACTION: f64 = 0.6;
 
     // Accel estimation (AIMING ONLY)
-    const ACC_SMOOTH: f64 = 0.35; // 0..1 (higher reacts faster)
-    const ACC_FADE_TAU: f64 = 5.0; // seconds; accel estimate decays toward 0 with age
+    const ACC_SMOOTH: f64 = 0.50;   // stronger smoothing on the final accel estimate
+    const ACC_FADE_TAU: f64 = 5.0;  // seconds; accel estimate decays toward 0 with age
 
     // Radar follow while fighting
     const RADAR_FOLLOW: bool = true;
@@ -189,15 +192,67 @@ impl Ship {
         t_accel.max(t_cap).min(1.0)
     }
 
-    /// Aiming-only prediction using constant acceleration.
+    // -------------------------
+    // Accel history helpers (AIMING ONLY)
+    // -------------------------
+    fn push_vel_sample(t: &mut Track, v: Vec2, tick: u32) {
+        let n = t.hist_len as usize;
+        let n2 = (n + 1).min(4);
+
+        for j in (1..n2).rev() {
+            t.vel_hist[j] = t.vel_hist[j - 1];
+            t.tick_hist[j] = t.tick_hist[j - 1];
+        }
+        t.vel_hist[0] = v;
+        t.tick_hist[0] = tick;
+        t.hist_len = n2 as u8;
+    }
+
+    fn accel_from_history(t: &Track) -> Vec2 {
+        let n = t.hist_len as usize;
+        if n < 2 {
+            return vec2(0.0, 0.0);
+        }
+
+        // ticks -> seconds
+        let mut ts = [0.0f64; 4];
+        for k in 0..n {
+            ts[k] = t.tick_hist[k] as f64 * TICK_LENGTH;
+        }
+
+        // means
+        let mut t_mean = 0.0;
+        let mut v_mean = vec2(0.0, 0.0);
+        for k in 0..n {
+            t_mean += ts[k];
+            v_mean += t.vel_hist[k];
+        }
+        t_mean /= n as f64;
+        v_mean /= n as f64;
+
+        // covariance/variance
+        let mut denom = 0.0;
+        let mut num = vec2(0.0, 0.0);
+        for k in 0..n {
+            let dt = ts[k] - t_mean;
+            denom += dt * dt;
+            num += (t.vel_hist[k] - v_mean) * dt;
+        }
+        if denom <= 1e-9 {
+            return vec2(0.0, 0.0);
+        }
+
+        num / denom
+    }
+
+    /// Aiming-only prediction using constant acceleration (from history).
     /// IMPORTANT: does NOT affect uncertainty growth; that's still worst-case elsewhere.
     fn predict_pos_vel_for_aim(t: &Track, dt: f64) -> (Vec2, Vec2) {
         let dt = dt.max(0.0);
+
         let age_ticks = t.est_tick.saturating_sub(t.contact_tick);
         let age = age_ticks as f64 * TICK_LENGTH;
 
-        // Fade accel estimate toward 0 as it gets stale.
-        // exp(-age/tau) style (approx) using clamp + pow for cheap stability.
         let fade = if age <= 0.0 {
             1.0
         } else {
@@ -213,9 +268,144 @@ impl Ship {
     }
 
     fn fighter_act(&mut self) {
-    f
+        if class() != Class::Fighter {
+            return;
+        }
 
+        let Some(i) = self.target else { return };
+        let Some(t) = self.tracks.get(i) else { return };
 
+        let me_p = position();
+        let me_v = velocity();
+        let me_h = heading();
+
+        let now = current_tick();
+        let target_changed = self.fire_latch_target.map_or(true, |prev| prev != i);
+        let latch_active0 = self.fire_latch_target == Some(i) && now <= self.fire_latch_until_tick;
+
+        // --- Turn-aware + accel-aware lead (2-iteration fixed-point) ---
+        let mut aim_point = t.est_pos;
+        let mut lead_t = 0.0;
+        let mut range = (t.est_pos - me_p).length().max(1.0);
+
+        for _ in 0..2 {
+            let to_aim = aim_point - me_p;
+            range = to_aim.length().max(1.0);
+            let desired_heading = to_aim.angle();
+            let ang_err0 = Self::wrap_angle(desired_heading - me_h);
+
+            let t_turn = Self::estimate_turn_time(ang_err0);
+
+            let (p0, v0) = Self::predict_pos_vel_for_aim(t, t_turn);
+
+            let p_rel = p0 - me_p;
+            let v_rel = v0 - me_v;
+
+            lead_t = Self::intercept_time(p_rel, v_rel, Self::FIGHTER_GUN_SPEED).unwrap_or(0.0);
+
+            let max_lead = (range / Self::FIGHTER_GUN_SPEED * 2.0).min(Self::MAX_LEAD_TIME);
+            lead_t = lead_t.clamp(0.0, max_lead);
+
+            if t.est_radius > Self::HIGH_UNCERTAINTY_THRESHOLD {
+                lead_t *= Self::HIGH_UNCERTAINTY_LEAD_MULT;
+            }
+
+            let t_total = t_turn + lead_t;
+            let (p_total, _) = Self::predict_pos_vel_for_aim(t, t_total);
+            aim_point = p_total;
+        }
+
+        // --- Jitter: allowed only when NOT latched (kept small) ---
+        let allow_jitter = !latch_active0 && t.est_radius > 50.0;
+        if allow_jitter && (self.aim_jitter_until_tick <= now || target_changed) {
+            let r = rand(0.0, 1.0).sqrt();
+            let th = rand(0.0, TAU);
+            let dir = vec2(th.cos(), th.sin());
+
+            let jmag = (t.est_radius * 0.10).min(20.0) * r;
+            self.aim_jitter = dir * jmag;
+            self.aim_jitter_until_tick = now + Self::JITTER_RESAMPLE_TICKS;
+        }
+        if allow_jitter {
+            aim_point += self.aim_jitter;
+        }
+
+        let dp = aim_point - me_p;
+        let desired_heading = dp.angle();
+
+        let ang_err = Self::wrap_angle(desired_heading - me_h);
+        let w = angular_velocity();
+
+        // --- Turning control ---
+        let kp = 8.0;
+        let speed = me_v.length();
+        let kd = 2.5 * (1.0 + speed / 300.0);
+
+        let w_cmd = (kp * ang_err - kd * w)
+            .clamp(-Self::DEFAULT_MAX_TURN_RATE_CAP, Self::DEFAULT_MAX_TURN_RATE_CAP);
+        turn(w_cmd);
+
+        // --- Movement control ---
+        let forward = vec2(me_h.cos(), me_h.sin());
+        let right = vec2(-me_h.sin(), me_h.cos());
+
+        let range_err = if range < Self::OPTIMAL_RANGE_MIN {
+            range - Self::OPTIMAL_RANGE_MIN
+        } else if range > Self::OPTIMAL_RANGE_MAX {
+            range - Self::OPTIMAL_RANGE_MAX
+        } else {
+            0.0
+        };
+
+        let closure_speed =
+            (range_err * Self::RANGE_GAIN).clamp(-Self::MAX_CLOSURE_SPEED, Self::MAX_CLOSURE_SPEED);
+
+        let to_aim = aim_point - me_p;
+        let to_aim_dir = if to_aim.length() > 1.0 { to_aim.normalize() } else { forward };
+
+        let v_des = t.est_vel + to_aim_dir * closure_speed;
+
+        let dv = v_des - me_v;
+
+        let dv_f = dv.dot(forward);
+        let dv_r = dv.dot(right);
+
+        let k_v_f = 2.0;
+        let k_v_r = 3.0;
+
+        let a_f = (k_v_f * dv_f).clamp(-max_backward_acceleration(), max_forward_acceleration());
+        let a_r = (k_v_r * dv_r).clamp(-max_lateral_acceleration(), max_lateral_acceleration());
+
+        accelerate(forward * a_f + right * a_r);
+
+        // --- Fire gating (no angular-velocity gate) ---
+        // Latch purely on angle.
+        let ang = ang_err.abs();
+        if ang <= Self::FIRE_ACQUIRE_EPS {
+            self.fire_latch_target = Some(i);
+            self.fire_latch_until_tick = now + Self::FIRE_LATCH_TICKS;
+        }
+
+        let latch_active = self.fire_latch_target == Some(i) && now <= self.fire_latch_until_tick;
+        let can_fire = latch_active && ang <= Self::FIRE_HOLD_EPS;
+
+        if can_fire {
+            fire(Self::GUN_INDEX);
+        } else if self.fire_latch_target == Some(i) && now > self.fire_latch_until_tick {
+            self.fire_latch_target = None;
+        }
+
+        debug!(
+            "act: target={} range={:.0} lead_t={:.2} ang_err={:.3} w={:.2} est_r={:.1} |a|={:.1}",
+            i,
+            range,
+            lead_t,
+            ang_err,
+            w,
+            t.est_radius,
+            t.est_acc.length()
+        );
+    }
 
     fn combat_profile_for_ship_class(c: Class) -> CombatProfile {
         match c {
@@ -306,15 +496,15 @@ impl Ship {
 
         let amax = Self::max_accel(track.class);
 
-        // IMPORTANT: keep estimate for matching simple & stable (constant-velocity)
+        // Matching stays constant-velocity
         track.est_pos = track.contact_pos + track.contact_vel * dt;
         track.est_vel = track.contact_vel;
 
-        // IMPORTANT: uncertainty growth remains WORST-CASE (max accel anywhere)
+        // Uncertainty growth remains WORST-CASE
         track.est_radius = track.contact_radius + 0.5 * amax * dt * dt;
         track.est_tick = now;
 
-        // accel used for aiming only
+        // Aiming accel from history
         track.est_acc = track.contact_acc;
     }
 
@@ -372,23 +562,21 @@ impl Ship {
             Some(i) => {
                 let t = &mut self.tracks[i];
 
-                // Estimate measured acceleration from delta-v / delta-t (aiming only)
-                let dt_ticks = contact.tick.saturating_sub(t.contact_tick).max(1);
-                let dt = dt_ticks as f64 * TICK_LENGTH;
+                // update accel history first (uses contact vel)
+                Self::push_vel_sample(t, contact.velocity, contact.tick);
 
-                let raw_a = (contact.velocity - t.contact_vel) / dt;
+                // robust accel from least-squares history (aiming only)
+                let mut a = Self::accel_from_history(t);
 
-                // Clamp accel magnitude by class (prevents noise spikes)
+                // clamp by class max accel (prevents noise spikes)
                 let amax = Self::max_accel(contact.class);
-                let mag = raw_a.length();
-                let a_clamped = if mag.is_finite() && mag > amax && amax > 0.0 {
-                    raw_a * (amax / mag)
-                } else {
-                    raw_a
-                };
+                let mag = a.length();
+                if mag.is_finite() && mag > amax && amax > 0.0 {
+                    a = a * (amax / mag);
+                }
 
-                // Smooth accel estimate
-                t.contact_acc = t.contact_acc * (1.0 - Self::ACC_SMOOTH) + a_clamped * Self::ACC_SMOOTH;
+                // smooth accel estimate
+                t.contact_acc = t.contact_acc * (1.0 - Self::ACC_SMOOTH) + a * Self::ACC_SMOOTH;
 
                 // Update anchor
                 t.class = contact.class;
@@ -413,6 +601,10 @@ impl Ship {
                     contact_tick: contact.tick,
 
                     contact_acc: vec2(0.0, 0.0),
+
+                    hist_len: 1,
+                    vel_hist: [contact.velocity; 4],
+                    tick_hist: [contact.tick; 4],
 
                     est_pos: contact.position,
                     est_vel: contact.velocity,
@@ -498,7 +690,7 @@ impl Ship {
     fn find_reacquire_candidate(&self) -> Option<usize> {
         let now = current_tick();
 
-        // First priority: tracks already in reacquire stage (not on cooldown)
+        // tracks already in reacquire stage (not on cooldown), prefer biggest radius
         let mut best_i: Option<usize> = None;
         let mut best_r: f64 = -1.0;
 
@@ -515,7 +707,7 @@ impl Ship {
             return best_i;
         }
 
-        // Second priority: tracks that need reacquire (not on cooldown)
+        // tracks that need reacquire (not on cooldown)
         best_i = None;
         best_r = -1.0;
         for (i, t) in self.tracks.iter().enumerate() {
@@ -616,8 +808,6 @@ impl Ship {
             return;
         }
 
-        // Follow current target tightly most ticks while fighting,
-        // but occasionally do a wide ping so we don't tunnel forever.
         if let Some(i) = self.target {
             let now = current_tick();
             if now % Self::RADAR_WIDE_PING_EVERY != 0 {
@@ -719,7 +909,10 @@ impl Ship {
             profile.fire_angle_eps,
         );
 
-        let t_proj = range / gun_speed;
+        // better than range/speed: use intercept time with relative velocity
+        let v_rel = track.est_vel - velocity();
+        let t_proj = Self::intercept_time(dp, v_rel, gun_speed).unwrap_or(range / gun_speed);
+
         let t_unc = profile.uncertainty_penalty * track.est_radius.max(0.0);
 
         let t = t_turn + t_proj + t_unc;
@@ -770,7 +963,7 @@ impl Ship {
             draw_polygon(center, radius, 32, 0.0, 0x00FFFF);
 
             debug!(
-                "track[{i}] class={:?} est_r={:.2} age={} reacq_stage={}{} acc=({:.1},{:.1})",
+                "track[{i}] class={:?} est_r={:.2} age={} reacq_stage={}{} acc=({:.1},{:.1}) n={}",
                 track.class,
                 track.est_radius,
                 track.est_tick.saturating_sub(track.contact_tick),
@@ -778,6 +971,7 @@ impl Ship {
                 if Some(i) == self.target { " [TARGET]" } else { "" },
                 track.est_acc.x,
                 track.est_acc.y,
+                track.hist_len,
             );
         }
     }
